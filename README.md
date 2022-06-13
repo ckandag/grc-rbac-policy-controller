@@ -1,12 +1,59 @@
 [comment]: # ( Copyright Contributors to the Open Cluster Management project )
 
-# Governance Policy Template Sync [![KinD tests](https://github.com/open-cluster-management-io/governance-policy-rbac-sync/actions/workflows/kind.yml/badge.svg?branch=main&event=push)](https://github.com/open-cluster-management-io/governance-policy-rbac-sync/actions/workflows/kind.yml)[![License](https://img.shields.io/:license-apache-blue.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
+# Governance RBAC Policy Controller 
 
 ## Description
 
-The governance policy template sync runs on managed clusters and updates objects defined in the templates of `Policies` in the cluster namespace. This controller is a part of the [governance-policy-framework](https://github.com/open-cluster-management-io/governance-policy-framework).
+This operator runs on the Hub and  watches for changes to the  `Policies` resources in any cluster naemspaces to trigger a reconcile. On each reconcile, it
 
-This operator watches for changes on `Policies` in the cluster namespace on the managed cluster to trigger a reconcile. On each reconcile, it creates/updates/deletes objects defined in the `spec.policy-templates` of those `Policies`.
+- It checks to see if its a ConfiurationPolicy
+- Checks to see if it has an annotation to indicate it needs to be  processed for finer-grained RBAC 
+    ```annotation: policy.open-cluster-management.io/process-rbac```
+- Processes the RoleBinding objects in the configurationPolicy
+    - Identify the Namespace
+    - Identify the Subject ( User or Usergroup)
+    - Identify the Role being assigned ( should process only if its   either admin, view, edit )
+- Find the target clusters of the policy through   placement decisions
+- Build the rbac-rules json and call the OPA service to pass the rbac information to OPA
+-Save the rbac-rules json  applied to the OPA in the status of the policy object
+
+
+Policy Watch Actions
+- On Policy object Create action, patch the additional rbac rules to OPA service, save the rbac-json rules in object status
+- On Policy object delete action, delete the rbac rules OPA service
+- On Policy object update action, compare the old json rules and new Rolesbindings and patch or delete rbac rules in OPA
+
+
+##Example 
+
+Conside the Rolebinding object in a ConfigurationPolicy deployed to managed-cluster "mc-test-1"
+
+```
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+    name: App0-Dev-Grp-binding1
+    namespace: ns0
+subjects:
+    - kind: User
+    apiGroup: rbac.authorization.k8s.io
+    name: user1
+roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: view
+```
+
+Rbac-Rules json passed OPA service api would be 
+
+{
+    "user" : "user1",
+    "managedcluster" : "mc-test-1",
+    "namespaces" : [ "ns0"],
+    "role" : "view"
+}
+
+
 
 ## Geting started
 
