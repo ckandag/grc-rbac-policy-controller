@@ -1,0 +1,74 @@
+# This is a sample policy to demonstrate testing RBAC Configuration
+
+# This Policy considers the following example scenario
+#   An  application  test  running on the Cluster in namespaces ns0a through ns0e.
+#
+# This Policy Configures the following rbac model for the above scenario
+#   UsersGroups:  dev-grp, ops-grp
+#   Rolebindings:
+#       dev-grp has view access to the namespace ns0a through ns0e
+#       ops-grp has admin access to the namespace ns0a through ns0e
+
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: policy-test-rbac
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: AC Access Control
+    policy.open-cluster-management.io/controls: AC-3 Access Enforcement
+    policy.open-cluster-management.io/process-for-rbac: "true"
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: policy-test-rbac
+        spec:
+          remediationAction: enforce 
+          severity: high
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                kind: RoleBinding
+                apiVersion: rbac.authorization.k8s.io/v1
+                metadata:
+                  name: test-Dev-Grp-binding1
+                  namespace: testns
+                subjects:
+                  - kind: User
+                    apiGroup: rbac.authorization.k8s.io
+                    name: testuser
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: view
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-policy-test-rbac
+placementRef:
+  name: placement-policy-test-rbac
+  kind: PlacementRule
+  apiGroup: apps.open-cluster-management.io
+subjects:
+- name: policy-test-rbac
+  kind: Policy
+  apiGroup: policy.open-cluster-management.io
+---
+apiVersion: apps.open-cluster-management.io/v1
+kind: PlacementRule
+metadata:
+  name: placement-policy-test-rbac
+spec:
+  clusterConditions:
+  - status: "True"
+    type: ManagedClusterConditionAvailable
+  clusterSelector:
+    matchExpressions:
+      - {key: vendor, operator: In, values: ["OpenShift"]}
+---
