@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"strconv"
 
 	"bytes"
@@ -35,8 +36,13 @@ const (
 )
 
 type aclentry struct {
-	RuleId string     `json:"ruleid"`
-	Rules  []*aclrule `json:"rules"`
+	Name      string    `json:"name"`
+	Namespace string    `json:"namespace"`
+	Rules     []aclrule `json:"acl"`
+}
+
+type policyrb struct {
+	PolicyRoleBinding []aclentry `json:"policyrolebindings"`
 }
 
 type aclrule struct {
@@ -44,6 +50,12 @@ type aclrule struct {
 	ManagedCluster string `json:"managedcluster"`
 	Namespace      string `json:"namespace"`
 	Role           string `json:"role"`
+}
+
+type patch struct {
+	Op    string   `json:"op"`
+	Path  string   `json:"path"`
+	Value aclentry `json:"value"`
 }
 
 var log = ctrl.Log.WithName(ControllerName)
@@ -95,8 +107,9 @@ func (r *PolicyReconciler) Reconcile(ctx context.Context, request reconcile.Requ
 
 			//remove any contents for it from OPA
 			var acl aclentry
-			acl.RuleId = request.Namespace + request.Name
-			removeAclsInOPA(acl)
+			acl.Namespace = request.Namespace + request.Name
+			acl.Name = request.Name
+			patchACL(acl, false)
 
 			return reconcile.Result{}, nil
 		}
@@ -109,32 +122,42 @@ func (r *PolicyReconciler) Reconcile(ctx context.Context, request reconcile.Requ
 
 	// //check for annotation and process policy
 	annotations := instance.GetAnnotations()
-	if process_rbac, ok := annotations["policy.open-cluster-management.io/process-for-rbac"]; ok {
+	if process_rbac, ok := annotations["policy.open-cluster-management.io/process-rbac"]; ok {
 		if boolProcessRbac, err := strconv.ParseBool(process_rbac); err == nil && boolProcessRbac {
 			log.Info("Detected annotation for processing rbac.")
 
 			//find all the managedcluster this policy is placed too
-			managedclusters, err := r.getManagedClusters(ctx, instance)
-			if err != nil {
-				reqLogger.Error(err, "Failed to find the placements for  the policy")
-				return reconcile.Result{}, err
+			managedclusters, err1 := r.getManagedClusters(ctx, instance)
+			if err1 != nil {
+				reqLogger.Error(err1, "Failed to find the placements for  the policy")
+				return reconcile.Result{}, err1
 			}
 			log.Info("printing data", " AllManagedClusters :", managedclusters)
 
-			for _, policyT := range instance.Spec.PolicyTemplates {
+			for policyIndex, policyT := range instance.Spec.PolicyTemplates {
 				if isConfigurationPolicy(policyT) {
 					log.Info("Is Config Policy.")
 
 					var acl aclentry
-					acl.RuleId = request.Namespace + request.Name
+					acl.Namespace = request.Namespace
+					acl.Name = request.Name
 
 					var configPolicy configpoliciesv1.ConfigurationPolicy //.map[string]interface{}
-					_ = json.Unmarshal(policyT.ObjectDefinition.Raw, &configPolicy)
+					err2 := json.Unmarshal(policyT.ObjectDefinition.Raw, &configPolicy)
+					if err2 != nil {
+						reqLogger.Error(err2, "Failed to find ConfigurationPolicy in the ObjectDefinition", "policyIndex", policyIndex)
+						continue
+					}
 
-					for _, objectT := range configPolicy.Spec.ObjectTemplates {
+					for templateIndex, objectT := range configPolicy.Spec.ObjectTemplates {
 						log.Info("Is Config Policy.")
 						var rolebinding rbacV1.RoleBinding
-						_ = json.Unmarshal(objectT.ObjectDefinition.Raw, &rolebinding)
+						err3 := json.Unmarshal(objectT.ObjectDefinition.Raw, &rolebinding)
+
+						if err3 != nil || rolebinding.Kind != "RoleBinding" {
+							reqLogger.Error(err3, "Failed to find RoleBinding in the ObjectTemplate", "templateIndex", templateIndex)
+							continue
+						}
 
 						//subject
 						subject := rolebinding.Subjects[0].Name
@@ -143,19 +166,19 @@ func (r *PolicyReconciler) Reconcile(ctx context.Context, request reconcile.Requ
 						//namespace
 						roleNS := rolebinding.Namespace
 
-						log.Info("Subject: " + subject + " Role: " + roleName + " Namespace: " + roleNS)
+						log.Info("Found RoleBinding: Subject: " + subject + " Role: " + roleName + " Namespace: " + roleNS)
 
 						//for each placement decision, make a call to opa to update
 						// or all of them as an array in one call ?
 						for _, mc := range managedclusters {
 							//make a call to OPA to update db
-							acl.Rules = append(acl.Rules, &aclrule{ManagedCluster: mc, Subject: subject, Role: roleName, Namespace: roleNS})
+							acl.Rules = append(acl.Rules, aclrule{ManagedCluster: mc, Subject: subject, Role: roleName, Namespace: roleNS})
 							//patch(mc, subject, roleName, roleNS)
 							//get()
 						}
 					}
 
-					postAclsToOPA(acl)
+					patchACL(acl, true)
 
 				}
 			}
@@ -238,12 +261,12 @@ func (r *PolicyReconciler) getManagedClusters(ctx context.Context, instance *pol
 	return allManagedClusters, nil
 }
 
-func get() {
+func get() ([]byte, error) {
 
-	resp, err := http.Get("https://localhost:8181/v1/data/acls?pretty")
+	resp, err := http.Get("https://localhost:8181/v1/data/policyrolebindings")
 	if err != nil {
-		log.Error(err, "patch failed")
-		return
+		log.Error(err, "get failed")
+		return nil, err
 	}
 
 	defer resp.Body.Close()
@@ -251,30 +274,79 @@ func get() {
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		log.Error(err, "get failed")
-		return
+		return nil, err
 	}
 
-	log.Info(string(body))
-
+	log.Info("body", "resutl", body)
+	return body, nil
 }
 
-func postAclsToOPA(acl aclentry) {
+func getIndex(acl aclentry) (int, error) {
+	content, err := get()
+	if err != nil {
+		fmt.Println("error getting content")
+		return -1, err
+	}
+	var r policyrb
+	if err := json.Unmarshal(content, &r); err != nil {
+		log.Error(err, "Failed to parse json")
+		return -1, err
+	}
 
+	for index, aclitem := range r.PolicyRoleBinding {
+		if aclitem.Name == acl.Name && aclitem.Namespace == acl.Namespace {
+			return index, nil
+		}
+	}
+	return -1, nil
+}
+
+type Patches []patch
+
+func patchACL(acl aclentry, add bool) {
 	log.Info("printing data", " aclEntry: :", acl)
 
-	jsonRequestBody, err := json.Marshal(acl.Rules)
+	op := "add"
+	index, err := getIndex(acl)
+	if err != nil {
+		return
+	}
+	if index < 0 && !add {
+		log.Info("couldn't find entry to remove")
+		return
+	}
+	path := "-"
+	if add && index >= 0 {
+		op = "replace"
+		path = fmt.Sprintf("/policyrolebindings[%d]/", index)
+	}
+	if !add {
+		op = "remove"
+		path = fmt.Sprintf("/policyrolebindings[%d]/", index)
+	}
+
+	var mypatch patch
+	mypatch.Op = op
+	mypatch.Path = path
+	mypatch.Value = acl
+
+	var patchlist = make(Patches, 1)
+	patchlist[0] = mypatch
+	//patchlist = append(patchlist, mypatch)
+	jsonRequestBody, err := json.Marshal(patchlist)
 	if err != nil {
 		log.Error(err, "Failed to marshall json")
 		return
 	}
-	log.Info("printing data", " jsonData: :", jsonRequestBody)
+	log.Info("printing data", " jsonData: :", string(jsonRequestBody))
 
 	timeout := time.Duration(100 * time.Second)
 	client := &http.Client{
 		Timeout: timeout,
 	}
-	request, err := http.NewRequest("PUT", "https://localhost:8181/v1/data/acls/"+acl.RuleId, bytes.NewBuffer(jsonRequestBody))
-	request.Header.Set("Content-type", "application/json")
+	request, err := http.NewRequest(http.MethodPatch, "https://localhost:8181/v1/data/policyrolebindings", bytes.NewBuffer(jsonRequestBody))
+
+	request.Header.Set("Content-type", "application/json-patch+json")
 
 	if err != nil {
 		log.Error(err, "update to OPA failed")
@@ -295,44 +367,4 @@ func postAclsToOPA(acl aclentry) {
 	}
 
 	log.Info(string(body))
-}
-
-func removeAclsInOPA(acl aclentry) {
-
-	log.Info("printing data", " aclEntry: :", acl)
-
-	jsonRequestBody, err := json.Marshal(acl.Rules)
-	if err != nil {
-		log.Error(err, "Failed to marshall json")
-		return
-	}
-	log.Info("printing data", " jsonData: :", jsonRequestBody)
-
-	timeout := time.Duration(100 * time.Second)
-	client := &http.Client{
-		Timeout: timeout,
-	}
-	request, err := http.NewRequest("DELETE", "https://localhost:8181/v1/data/acls/"+acl.RuleId, bytes.NewBuffer(jsonRequestBody))
-	request.Header.Set("Content-type", "application/json")
-
-	if err != nil {
-		log.Error(err, "update to OPA failed")
-		return
-	}
-	resp, err := client.Do(request)
-	if err != nil {
-		log.Error(err, "update to OPA failed")
-		return
-	}
-
-	defer resp.Request.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Error(err, "update to OPA  failed")
-		return
-	}
-
-	log.Info(string(body))
-
 }
